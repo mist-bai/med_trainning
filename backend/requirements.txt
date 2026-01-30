@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+langgraph
+langchain-openai
+langchain-community
+langchain-deepseek
+redis
+qdrant-client
+pymysql
+sqlalchemy
+pydantic-settings
+python-multipart
+sentence-transformers
+torch

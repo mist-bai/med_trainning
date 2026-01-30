@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+  backend:
+    image: docker.m.daocloud.io/library/python:3.11-slim
+    container_name: med_backend
+    volumes:
+      - ./backend:/app
+    working_dir: /app
+    # 告诉 docker-compose 加载 .env 文件
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    command: bash /app/start.sh
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - med_bridge
+
+  # 前端同理
+  frontend:
+    image: docker.m.daocloud.io/library/node:20-slim
+    container_name: med_frontend
+    volumes:
+      - ./frontend:/app
+    working_dir: /app
+    env_file:
+      - .env
+    ports:
+      - "3000:3000"
+    command: bash /app/start.sh
+    networks:
+      - med_bridge
+    deploy:
+      resources:
+        limits:
+          memory: 1500M
+networks:
+  med_bridge:
+    external: true  # 假设你已经按之前的步骤手动创建了该网络

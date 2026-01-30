@@ -1,0 +1,38 @@
+# 环境与密钥（切勿提交）
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+*.egg-info/
+.eggs/
+
+# Node / Next.js
+node_modules/
+frontend/.next/
+frontend/out/
+frontend/build/
+*.tsbuildinfo
+next-env.d.ts
+
+# 大模型/权重目录（按需取消注释以提交）
+backend/models/paraphrase-multilingual-MiniLM-L12-v2/
+
+# 系统与编辑器
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# 日志与临时
+*.log
+*.tmp
+.cache/
