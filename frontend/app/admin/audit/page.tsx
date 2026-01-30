@@ -25,6 +25,20 @@ export default function AuditPage() {
   const [loading, setLoading] = useState(true);
   const [processing, setProcessing] = useState<number | null>(null);
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  /** 拒绝原因（按任务 ID），将发送给 DeepSeek 用于重新生成题目 */
+  const [rejectReasons, setRejectReasons] = useState<Record<number, string>>({});
+  /** 用户输入的关键词或知识点，用于检索知识库并生成题目 */
+  const [keywordInput, setKeywordInput] = useState('');
+  /** 生成试题数量（1-10） */
+  const [questionCount, setQuestionCount] = useState(1);
+  /** 试题类型 */
+  const [questionType, setQuestionType] = useState<string>('single_choice');
+  /** 是否正在生成试题（仅按钮 Loading，不阻塞列表） */
+  const [generating, setGenerating] = useState(false);
+  /** 待审批任务勾选（用于全选一键通过） */
+  const [selectedTaskIds, setSelectedTaskIds] = useState<Set<number>>(new Set());
+  /** 是否正在批量审批 */
+  const [batchApproving, setBatchApproving] = useState(false);
 
   // 获取待审核列表
   const fetchAuditList = async () => {
@@ -53,6 +67,11 @@ export default function AuditPage() {
       setProcessing(taskId);
       setMessage(null);
 
+      const comment =
+        status === 'approved'
+          ? '审核通过'
+          : (rejectReasons[taskId]?.trim() || '未填写原因（将发送给 DeepSeek 重新生成题目）');
+
       const response = await fetch(`/audit/action/${taskId}`, {
         method: 'POST',
         headers: {
@@ -60,7 +79,7 @@ export default function AuditPage() {
         },
         body: JSON.stringify({
           status,
-          comment: status === 'approved' ? '审核通过' : '审核拒绝',
+          comment,
         }),
       });
 
@@ -76,7 +95,11 @@ export default function AuditPage() {
           type: 'success',
           text: data.message,
         });
-        // 刷新列表
+        setRejectReasons((prev) => {
+          const next = { ...prev };
+          delete next[taskId];
+          return next;
+        });
         await fetchAuditList();
       } else {
         throw new Error(data.message || '审核操作失败');
@@ -91,19 +114,68 @@ export default function AuditPage() {
     }
   };
 
-  // 触发智能体生成题目
+  const toggleSelectTask = (taskId: number) => {
+    setSelectedTaskIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(taskId)) next.delete(taskId);
+      else next.add(taskId);
+      return next;
+    });
+  };
+
+  const toggleSelectAllTasks = () => {
+    if (auditList.length === 0) return;
+    if (selectedTaskIds.size === auditList.length) setSelectedTaskIds(new Set());
+    else setSelectedTaskIds(new Set(auditList.map((x) => x.id)));
+  };
+
+  const handleBatchApprove = async () => {
+    const ids = selectedTaskIds.size > 0 ? Array.from(selectedTaskIds) : auditList.map((x) => x.id);
+    if (ids.length === 0) return;
+    setBatchApproving(true);
+    setMessage(null);
+    let ok = 0;
+    let err = '';
+    for (const taskId of ids) {
+      try {
+        const res = await fetch(`/audit/action/${taskId}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ status: 'approved', comment: '审核通过' }),
+        });
+        const data = await res.json();
+        if (data.success) ok++;
+        else err = data.message || '审核失败';
+      } catch (e) {
+        err = e instanceof Error ? e.message : '请求失败';
+      }
+    }
+    setSelectedTaskIds(new Set());
+    await fetchAuditList();
+    setMessage({
+      type: err ? 'error' : 'success',
+      text: err ? err : `已一键通过 ${ok} 道题目`,
+    });
+    setBatchApproving(false);
+  };
+
+  // 触发智能体生成题目（仅按钮 Loading）
   const handleStartAgent = async () => {
     try {
-      setLoading(true);
+      setGenerating(true);
       setMessage(null);
 
+      const query = keywordInput.trim() || '医药合规法规条款';
+      const count = Math.max(1, Math.min(10, questionCount));
       const response = await fetch('/agent/start', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          query: '医药合规法规条款',
+          query,
+          question_count: count,
+          question_type: questionType || 'single_choice',
         }),
       });
 
@@ -118,7 +190,6 @@ export default function AuditPage() {
           type: 'success',
           text: data.message,
         });
-        // 刷新列表
         await fetchAuditList();
       } else {
         throw new Error(data.message || '启动智能体失败');
@@ -129,7 +200,7 @@ export default function AuditPage() {
         text: error instanceof Error ? error.message : '启动智能体失败',
       });
     } finally {
-      setLoading(false);
+      setGenerating(false);
     }
   };
 
@@ -141,29 +212,88 @@ export default function AuditPage() {
   }, []);
 
   return (
-    <div className="min-h-screen bg-gray-50 py-8">
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-        {/* 头部 */}
+    <div className="min-h-screen bg-slate-50 py-8">
+      <div className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8">
+        {/* 顶部：深蓝+琥珀标题 + 亮白区域 */}
         <div className="mb-8">
-          <div className="flex justify-between items-center">
-            <h1 className="text-3xl font-bold text-gray-900">审核管理</h1>
-            <button
-              onClick={handleStartAgent}
-              disabled={loading}
-              className="bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 text-white font-semibold py-2 px-4 rounded-lg transition duration-200"
+          <div className="flex items-center justify-between mb-6">
+            <h1 className="text-2xl font-bold text-slate-800 tracking-tight">
+              <span className="text-amber-600">审核</span>管理
+            </h1>
+            <a
+              href="/admin/questions"
+              className="text-sm font-medium text-violet-600 hover:text-violet-800 transition-colors"
             >
-              {loading ? '生成中...' : '生成新题目'}
-            </button>
+              审核通过试题库 →
+            </a>
+          </div>
+
+          {/* 大 Textarea 输入区 */}
+          <div className="bg-white rounded-xl shadow-sm border border-slate-200/80 p-5 mb-4">
+            <label className="block text-sm font-medium text-slate-700 mb-2">
+              题目主题 / 合规条款关键词
+            </label>
+            <textarea
+              value={keywordInput}
+              onChange={(e) => setKeywordInput(e.target.value)}
+              placeholder="请输入题目主题或相关合规条款关键词（如：招待标准、学术会议禁令）"
+              rows={3}
+              disabled={generating}
+              className="w-full px-4 py-3 rounded-lg border border-slate-200 text-slate-800 placeholder-slate-400 focus:ring-2 focus:ring-slate-400/30 focus:border-slate-400 outline-none transition disabled:bg-slate-50 disabled:text-slate-500"
+            />
+            <div className="flex flex-wrap items-center gap-4 mt-4">
+              <label className="flex items-center gap-2 text-sm text-slate-600">
+                <span>生成数量</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={10}
+                  value={questionCount}
+                  onChange={(e) => setQuestionCount(Math.max(1, Math.min(10, parseInt(e.target.value, 10) || 1)))}
+                  disabled={generating}
+                  className="w-14 px-2 py-1.5 rounded border border-slate-200 text-slate-800 text-center text-sm focus:ring-2 focus:ring-slate-400/30 focus:border-slate-400 outline-none disabled:bg-slate-50"
+                />
+              </label>
+              <label className="flex items-center gap-2 text-sm text-slate-600">
+                <span>试题类型</span>
+                <select
+                  value={questionType}
+                  onChange={(e) => setQuestionType(e.target.value)}
+                  disabled={generating}
+                  className="px-3 py-1.5 rounded border border-slate-200 text-slate-800 text-sm bg-white focus:ring-2 focus:ring-slate-400/30 focus:border-slate-400 outline-none disabled:bg-slate-50"
+                >
+                  <option value="single_choice">单选题</option>
+                  <option value="multiple_choice">多选题</option>
+                  <option value="true_false">判断题</option>
+                  <option value="subjective">主观题</option>
+                  <option value="fill_blank">填空题</option>
+                </select>
+              </label>
+              <button
+                onClick={handleStartAgent}
+                disabled={generating}
+                className="inline-flex items-center justify-center gap-2 min-w-[140px] px-5 py-2.5 rounded-lg bg-teal-600 hover:bg-teal-700 disabled:bg-slate-400 disabled:cursor-not-allowed text-white font-medium text-sm shadow-sm transition-colors"
+              >
+                {generating ? (
+                  <>
+                    <span className="inline-block w-4 h-4 border-2 border-white/40 border-t-white rounded-full animate-spin" />
+                    生成中…
+                  </>
+                ) : (
+                  '开始生成试题'
+                )}
+              </button>
+            </div>
           </div>
         </div>
 
         {/* 消息提示 */}
         {message && (
           <div
-            className={`mb-4 p-4 rounded-lg ${
+            className={`mb-6 p-4 rounded-lg border ${
               message.type === 'success'
-                ? 'bg-green-100 text-green-800 border border-green-300'
-                : 'bg-red-100 text-red-800 border border-red-300'
+                ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
+                : 'bg-red-50 text-red-800 border-red-200'
             }`}
           >
             {message.text}
@@ -172,83 +302,148 @@ export default function AuditPage() {
 
         {/* 待审核列表 */}
         {loading && auditList.length === 0 ? (
-          <div className="text-center py-12">
-            <div className="inline-block animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600"></div>
-            <p className="mt-4 text-gray-600">加载中...</p>
+          <div className="text-center py-16 bg-white rounded-xl shadow-sm border border-slate-200/80">
+            <div className="inline-block w-8 h-8 border-2 border-slate-300 border-t-slate-600 rounded-full animate-spin" />
+            <p className="mt-4 text-slate-600">加载中…</p>
           </div>
         ) : auditList.length === 0 ? (
-          <div className="text-center py-12 bg-white rounded-lg shadow">
-            <p className="text-gray-500 text-lg">暂无待审核题目</p>
-            <p className="text-gray-400 text-sm mt-2">点击"生成新题目"按钮开始生成</p>
+          <div className="text-center py-16 bg-white rounded-xl shadow-sm border border-slate-200/80">
+            <p className="text-slate-600 text-lg">暂无待审核题目</p>
+            <p className="text-slate-400 text-sm mt-2">在上方输入主题或关键词后，点击「开始生成试题」</p>
           </div>
         ) : (
           <div className="space-y-6">
+            {/* 全选 + 一键审批通过 工具栏 */}
+            <div className="flex flex-wrap items-center gap-3 p-4 rounded-xl bg-white border border-slate-200/80 shadow-sm">
+              <label className="flex items-center gap-2 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={auditList.length > 0 && selectedTaskIds.size === auditList.length}
+                  onChange={toggleSelectAllTasks}
+                  disabled={batchApproving}
+                  className="rounded border-slate-300 text-amber-600 focus:ring-amber-500/40"
+                />
+                <span className="text-sm font-medium text-slate-700">全选</span>
+              </label>
+              <button
+                type="button"
+                onClick={handleBatchApprove}
+                disabled={batchApproving}
+                className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-amber-500 hover:bg-amber-600 disabled:bg-slate-300 text-white font-medium text-sm shadow-sm transition-colors"
+              >
+                {batchApproving ? (
+                  <>
+                    <span className="w-4 h-4 border-2 border-white/40 border-t-white rounded-full animate-spin" />
+                    审批中…
+                  </>
+                ) : (
+                  `一键审批通过${selectedTaskIds.size > 0 ? `（${selectedTaskIds.size}）` : ''}`
+                )}
+              </button>
+              <span className="text-xs text-slate-500">
+                共 {auditList.length} 道待审核 · 未勾选时点击将全部通过
+              </span>
+            </div>
+
             {auditList.map((item) => (
               <div
                 key={item.id}
-                className="bg-white rounded-lg shadow-md p-6 hover:shadow-lg transition-shadow"
+                className="bg-white rounded-xl shadow-sm border border-slate-200/80 p-6 hover:shadow-lg hover:border-amber-200/60 transition-all duration-200"
               >
-                <div className="flex justify-between items-start mb-4">
-                  <div className="flex-1">
-                    <div className="flex items-center gap-2 mb-2">
-                      <span className="bg-blue-100 text-blue-800 text-xs font-semibold px-2.5 py-0.5 rounded">
+                <div className="flex justify-between items-start gap-4 mb-4">
+                  <label className="flex items-center gap-2 shrink-0 cursor-pointer select-none pt-0.5">
+                    <input
+                      type="checkbox"
+                      checked={selectedTaskIds.has(item.id)}
+                      onChange={() => toggleSelectTask(item.id)}
+                      disabled={batchApproving || processing === item.id}
+                      className="rounded border-slate-300 text-amber-600 focus:ring-amber-500/40"
+                    />
+                    <span className="text-xs font-medium text-slate-500">勾选通过</span>
+                  </label>
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 mb-3 flex-wrap">
+                      <span className="text-xs font-semibold text-amber-700 bg-amber-100 px-2.5 py-1 rounded-md">
                         任务 #{item.id}
                       </span>
-                      <span className="text-sm text-gray-500">
+                      <span className="text-xs text-slate-400">
                         {new Date(item.created_at).toLocaleString('zh-CN')}
                       </span>
                     </div>
-                    <h3 className="text-lg font-semibold text-gray-900 mb-4">
+                    <h3 className="text-base font-semibold text-slate-800 leading-snug">
                       {item.question.question}
                     </h3>
                   </div>
                 </div>
 
-                {/* 选项 */}
+                {/* 选项：较小字号 */}
                 <div className="space-y-2 mb-4">
-                  {Object.entries(item.question.options).map(([key, value]) => (
-                    <div
-                      key={key}
-                      className={`p-3 rounded border ${
-                        item.question.answer === key
-                          ? 'bg-green-50 border-green-300'
-                          : 'bg-gray-50 border-gray-200'
-                      }`}
-                    >
-                      <span className="font-semibold text-gray-700">{key}.</span>{' '}
-                      <span className="text-gray-700">{value}</span>
-                      {item.question.answer === key && (
-                        <span className="ml-2 text-green-600 font-semibold">✓ 正确答案</span>
-                      )}
+                  {Object.keys(item.question.options || {}).length > 0 ? (
+                    Object.entries(item.question.options || {}).map(([key, value]) => (
+                      <div
+                        key={key}
+                        className={`p-3 rounded-lg border text-sm ${
+                          String(item.question.answer).split(',').includes(key)
+                            ? 'bg-emerald-50/80 border-emerald-200 text-slate-800'
+                            : 'bg-slate-50/80 border-slate-200 text-slate-700'
+                        }`}
+                      >
+                        <span className="font-medium text-slate-600">{key}.</span>{' '}
+                        <span>{value}</span>
+                        {String(item.question.answer).split(',').includes(key) && (
+                          <span className="ml-2 text-emerald-600 font-medium text-xs">✓ 正确答案</span>
+                        )}
+                      </div>
+                    ))
+                  ) : (
+                    <div className="p-3 rounded-lg border border-slate-200 bg-slate-50/80 text-sm text-slate-700">
+                      <span className="font-medium text-slate-600">参考答案：</span>
+                      <span className="whitespace-pre-wrap">{item.question.answer}</span>
                     </div>
-                  ))}
+                  )}
                 </div>
 
                 {/* 解析 */}
                 {item.question.explanation && (
-                  <div className="mb-4 p-4 bg-gray-50 rounded border border-gray-200">
-                    <h4 className="font-semibold text-gray-900 mb-2">解析：</h4>
-                    <p className="text-gray-700 whitespace-pre-wrap">
+                  <div className="mb-4 p-4 rounded-lg border border-slate-200 bg-slate-50/50">
+                    <h4 className="text-sm font-semibold text-slate-700 mb-2">解析</h4>
+                    <p className="text-sm text-slate-600 whitespace-pre-wrap leading-relaxed">
                       {item.question.explanation}
                     </p>
                   </div>
                 )}
 
-                {/* 操作按钮 */}
-                <div className="flex gap-3 pt-4 border-t border-gray-200">
+                {/* 拒绝原因 */}
+                <div className="mb-4">
+                  <label className="block text-sm font-medium text-slate-600 mb-1">
+                    拒绝原因（选填，将发送给 DeepSeek 重新生成）
+                  </label>
+                  <textarea
+                    value={rejectReasons[item.id] ?? ''}
+                    onChange={(e) =>
+                      setRejectReasons((prev) => ({ ...prev, [item.id]: e.target.value }))
+                    }
+                    placeholder="例如：选项表述不清、与条款不符……"
+                    className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm text-slate-700 placeholder-slate-400 focus:ring-2 focus:ring-slate-400/30 focus:border-slate-400 outline-none"
+                    rows={2}
+                  />
+                </div>
+
+                {/* 操作按钮：绿/红 + 琥珀点缀 */}
+                <div className="flex gap-3 pt-4 border-t border-slate-200">
                   <button
                     onClick={() => handleAudit(item.id, 'approved')}
-                    disabled={processing === item.id}
-                    className="flex-1 bg-green-600 hover:bg-green-700 disabled:bg-gray-400 text-white font-semibold py-2 px-4 rounded-lg transition duration-200"
+                    disabled={processing === item.id || batchApproving}
+                    className="flex-1 py-2.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 disabled:bg-slate-300 text-white font-medium text-sm transition-colors shadow-sm"
                   >
-                    {processing === item.id ? '处理中...' : '✓ 通过'}
+                    {processing === item.id ? '处理中…' : '✓ 通过'}
                   </button>
                   <button
                     onClick={() => handleAudit(item.id, 'rejected')}
-                    disabled={processing === item.id}
-                    className="flex-1 bg-red-600 hover:bg-red-700 disabled:bg-gray-400 text-white font-semibold py-2 px-4 rounded-lg transition duration-200"
+                    disabled={processing === item.id || batchApproving}
+                    className="flex-1 py-2.5 rounded-lg bg-rose-600 hover:bg-rose-700 disabled:bg-slate-300 text-white font-medium text-sm transition-colors shadow-sm"
                   >
-                    {processing === item.id ? '处理中...' : '✗ 拒绝'}
+                    {processing === item.id ? '处理中…' : '✗ 拒绝并重新生成'}
                   </button>
                 </div>
               </div>

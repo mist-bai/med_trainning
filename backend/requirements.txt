@@ -12,3 +12,4 @@ pydantic-settings
 python-multipart
 sentence-transformers
 torch
+openpyxl

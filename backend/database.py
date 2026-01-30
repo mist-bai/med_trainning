@@ -46,16 +46,17 @@ class AuditStatus(str, enum.Enum):
     REJECTED = "rejected"
 
 
-# ExamQuestion 模型：存储最终生成的试题
+# ExamQuestion 模型：存储最终生成的试题（支持单选/多选/判断/主观/填空）
 class ExamQuestion(Base):
     __tablename__ = "exam_questions"
 
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     question = Column(Text, nullable=False, comment="题目内容")
-    options = Column(Text, nullable=False, comment="选项（JSON格式）")
-    answer = Column(String(10), nullable=False, comment="正确答案（如：A、B、C、D）")
+    options = Column(Text, nullable=False, comment="选项（JSON格式，主观题/填空可为空对象）")
+    answer = Column(Text, nullable=False, comment="正确答案（单选A、多选A,B,C、判断正确/错误、主观题/填空为文本）")
     explanation = Column(Text, nullable=True, comment="解析")
     source_document = Column(String(255), nullable=True, comment="来源文档名")
+    question_type = Column(String(32), nullable=True, comment="试题类型：single_choice/multiple_choice/true_false/subjective/fill_blank")
     created_at = Column(DateTime, default=datetime.utcnow, comment="创建时间")
 
     # 关联审核任务
@@ -77,14 +78,45 @@ class AuditTask(Base):
     question = relationship("ExamQuestion", back_populates="audit_tasks")
 
 
+def _migrate_exam_questions():
+    """为已存在的 exam_questions 表增加 question_type、将 answer 改为 TEXT（若尚未修改）"""
+    from sqlalchemy import text
+    conn = engine.connect()
+    try:
+        # 检查是否有 question_type 列（以 MySQL 为例）
+        r = conn.execute(text(
+            "SELECT COUNT(*) FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'exam_questions' AND COLUMN_NAME = 'question_type'"
+        ))
+        if r.scalar() == 0:
+            conn.execute(text("ALTER TABLE exam_questions ADD COLUMN question_type VARCHAR(32) NULL COMMENT '试题类型'"))
+            conn.commit()
+            print("✅ 已添加 exam_questions.question_type 列")
+        # 将 answer 从 VARCHAR(10) 改为 TEXT（若当前为 varchar）
+        r = conn.execute(text(
+            "SELECT DATA_TYPE FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'exam_questions' AND COLUMN_NAME = 'answer'"
+        ))
+        row = r.fetchone()
+        if row and (row[0] or "").lower() in ("varchar", "char"):
+            conn.execute(text("ALTER TABLE exam_questions MODIFY COLUMN answer TEXT NOT NULL COMMENT '正确答案'"))
+            conn.commit()
+            print("✅ 已将 exam_questions.answer 改为 TEXT")
+    except Exception as e:
+        print(f"⚠️ 数据库迁移跳过或失败（可手动执行 ALTER TABLE）: {e}")
+        conn.rollback()
+    finally:
+        conn.close()
+
+
 def init_database():
     """
-    初始化数据库，自动创建表（如果不存在）
+    初始化数据库，自动创建表（如果不存在），并执行必要迁移
     在服务启动时调用此函数
     """
     try:
-        # 创建所有表
         Base.metadata.create_all(bind=engine)
+        _migrate_exam_questions()
         print("✅ 数据库表初始化成功")
         return True
     except Exception as e:

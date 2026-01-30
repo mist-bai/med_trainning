@@ -12,7 +12,7 @@ from datetime import datetime
 from sqlalchemy.orm import Session
 from database import AuditTask, ExamQuestion, AuditStatus, SessionLocal
 from pydantic_settings import BaseSettings
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 import redis
 import os
 
@@ -62,33 +62,47 @@ redis_client = redis.Redis(
 )
 
 
-# 定义状态结构
+# 试题类型枚举（与前端一致）
+QUESTION_TYPES = {
+    "single_choice": "单选题",
+    "multiple_choice": "多选题",
+    "true_false": "判断题",
+    "subjective": "主观题",
+    "fill_blank": "填空题",
+}
+
+# 定义状态结构（与参考 GraphState 对应：用户输入 -> 检索 -> 生成）
 class WorkflowState(TypedDict):
-    query: str  # 用户查询（用于检索）
+    question_context: str  # 用户输入的关键词/知识点
+    query: str  # 兼容旧字段，与 question_context 同义
     retrieved_clauses: List[Dict[str, Any]]  # 检索到的合规条款
-    generated_question: Optional[Dict[str, Any]]  # 生成的题目
-    audit_task_id: Optional[int]  # 审核任务ID
-    approval_status: Optional[Literal["approved", "rejected"]]  # 审核状态
-    audit_comment: Optional[str]  # 审核意见
-    source_document: Optional[str]  # 来源文档名
+    retrieved_docs: List[str]  # 检索到的文档正文列表
+    question_count: int  # 生成试题数量（1-10）
+    question_type: str  # 试题类型：single_choice / multiple_choice / true_false / subjective / fill_blank
+    generated_question: Optional[Dict[str, Any]]  # 单题（兼容）
+    generated_questions: Optional[List[Dict[str, Any]]]  # 多题列表
+    audit_task_id: Optional[int]  # 第一个审核任务ID（兼容）
+    audit_task_ids: Optional[List[int]]  # 所有审核任务ID
+    approval_status: Optional[Literal["approved", "rejected"]]
+    audit_comment: Optional[str]
+    source_document: Optional[str]
+    rejection_reason: Optional[str]
 
 
 def retrieve_clauses(state: WorkflowState) -> WorkflowState:
     """
-    节点1：从 Qdrant 检索合规条款
-    使用 sentence-transformers (384维) 从 med_knowledge_base 集合中检索 5 条合规条款
+    节点1（retrieve_node）：根据用户输入的关键词/知识点去 Qdrant 检索
+    使用 question_context（或兼容 query）作为检索词，sentence-transformers 向量检索
     """
-    query = state.get("query", "")
-    
-    if not query:
-        # 如果没有查询，使用默认查询
-        query = "医药合规法规条款"
+    # 优先使用用户输入的关键词/知识点
+    question_context = (state.get("question_context") or state.get("query") or "").strip()
+    if not question_context:
+        question_context = "医药合规法规条款"
     
     # 生成查询向量（384维）
-    query_vector = embedding_model.encode(query).tolist()
+    query_vector = embedding_model.encode(question_context).tolist()
     
     try:
-        # 从 Qdrant 检索（使用 query_points API，直接传入向量列表）
         search_results = qdrant_client.query_points(
             collection_name="med_knowledge_base",
             query=query_vector,
@@ -97,92 +111,124 @@ def retrieve_clauses(state: WorkflowState) -> WorkflowState:
             with_vectors=False
         )
         
-        # 格式化检索结果
         clauses = []
+        doc_texts = []
         for result in search_results.points:
-            clause_data = {
-                "text": result.payload.get("text", "") if result.payload else "",
-                "document": result.payload.get("document", "") if result.payload else "",
+            text = result.payload.get("text", "") if result.payload else ""
+            document = result.payload.get("document", "") if result.payload else ""
+            clauses.append({
+                "text": text,
+                "document": document,
                 "score": result.score if hasattr(result, 'score') else 0.0
-            }
-            clauses.append(clause_data)
+            })
+            doc_texts.append(text)
         
-        # 提取来源文档名（取第一个结果的文档名）
         source_doc = clauses[0]["document"] if clauses else None
-        
         return {
             **state,
+            "question_context": question_context,
+            "query": question_context,
             "retrieved_clauses": clauses,
+            "retrieved_docs": doc_texts,
             "source_document": source_doc
         }
     except Exception as e:
         print(f"❌ 检索失败: {str(e)}")
         return {
             **state,
+            "question_context": question_context or state.get("question_context", ""),
             "retrieved_clauses": [],
+            "retrieved_docs": [],
             "source_document": None
         }
 
 
+def _type_spec(state: WorkflowState) -> Tuple[str, str]:
+    """根据 question_type 返回题型说明和期望的 JSON 格式说明。"""
+    qtype = (state.get("question_type") or "single_choice").strip() or "single_choice"
+    count = max(1, min(10, int(state.get("question_count") or 1)))
+    type_desc = QUESTION_TYPES.get(qtype, "单选题")
+    if qtype == "single_choice":
+        fmt = '''每道题格式：{"question": "题目", "options": {"A":"...","B":"...","C":"...","D":"..."}, "answer": "A", "explanation": "解析"}'''
+    elif qtype == "multiple_choice":
+        fmt = '''每道题格式：{"question": "题目", "options": {"A":"...","B":"...","C":"...","D":"..."}, "answer": "A,B,C", "explanation": "解析"}（answer 为多个正确选项字母用逗号连接）'''
+    elif qtype == "true_false":
+        fmt = '''每道题格式：{"question": "题目", "options": {"正确": "正确", "错误": "错误"}, "answer": "正确" 或 "错误", "explanation": "解析"}'''
+    elif qtype == "subjective":
+        fmt = '''每道题格式：{"question": "题目", "options": {}, "answer": "参考答案（要点）", "explanation": "解析"}'''
+    elif qtype == "fill_blank":
+        fmt = '''每道题格式：题目中用 _____ 表示填空；{"question": "题干_____处_____", "options": {}, "answer": "空1:答案1; 空2:答案2", "explanation": "解析"}'''
+    else:
+        fmt = '''每道题格式：{"question": "题目", "options": {"A":"...","B":"...","C":"...","D":"..."}, "answer": "A", "explanation": "解析"}'''
+    return type_desc, fmt
+
+
 def generate_question(state: WorkflowState) -> WorkflowState:
     """
-    节点2：调用 DeepSeek-V3 API 生成题目
-    根据检索到的条款生成 1 道高质量的医药合规选择题
+    节点2（generate_node）：根据检索资料 + 用户要求 + 试题数量与类型，生成题目
+    支持：单选、多选、判断、主观题、填空题；可一次生成 1-10 道
     """
     clauses = state.get("retrieved_clauses", [])
+    retrieved_docs = state.get("retrieved_docs") or []
+    user_req = (state.get("question_context") or state.get("query") or "").strip() or "医药合规法规"
+    question_count = max(1, min(10, int(state.get("question_count") or 1)))
+    question_type = (state.get("question_type") or "single_choice").strip() or "single_choice"
     
-    if not clauses:
+    if not clauses and not retrieved_docs:
         return {
             **state,
-            "generated_question": None
+            "generated_question": None,
+            "generated_questions": [],
         }
     
-    # 构建提示词
-    clauses_text = "\n\n".join([
-        f"条款 {i+1}（来源：{clause.get('document', '未知')}）：\n{clause.get('text', '')}"
-        for i, clause in enumerate(clauses)
-    ])
+    if retrieved_docs:
+        docs_text = "\n\n".join([f"【资料 {i+1}】\n{t}" for i, t in enumerate(retrieved_docs)])
+    else:
+        docs_text = "\n\n".join([
+            f"【资料 {i+1}】（来源：{c.get('document', '未知')}）\n{c.get('text', '')}"
+            for i, c in enumerate(clauses)
+        ])
     
-    prompt = f"""你是一位医药合规培训专家。请根据以下合规条款，生成一道高质量的医药合规选择题。
+    rejection_hint = ""
+    if state.get("rejection_reason"):
+        rejection_hint = f"\n【重要】上一题被拒绝，请根据以下原因改进：{state.get('rejection_reason')}\n\n"
+    
+    type_desc, format_desc = _type_spec(state)
+    num_hint = f"共生成 {question_count} 道{type_desc}。" if question_count > 1 else f"生成 1 道{type_desc}。"
+    
+    if question_count > 1:
+        output_instruction = f'请以 JSON 格式返回，且只返回一个 JSON 对象，包含键 "questions"，值为数组，数组中有 {question_count} 个对象。' + format_desc
+    else:
+        output_instruction = '请以 JSON 格式返回，且只返回一个 JSON 对象。' + format_desc
+    
+    prompt = f"""你是一位医药合规培训专家。请根据以下「参考资料」和「用户特定要求」出题。
+{rejection_hint}
+## 参考资料
+{docs_text}
 
-要求：
-1. 题目必须基于提供的合规条款内容
-2. 题目应该具有实际应用价值，能够测试对合规要求的理解
-3. 提供4个选项（A、B、C、D），其中只有一个正确答案
-4. 提供详细的解析，说明为什么选择该答案
-5. 题目和选项应该清晰、准确、无歧义
+## 用户特定要求/关键词
+{user_req}
 
-合规条款内容：
-{clauses_text}
+## 出题要求
+{num_hint}
+题型：{type_desc}。题目必须基于上述合规条款，紧扣用户关键词，表述清晰、无歧义，并给出解析。
 
-请以JSON格式返回，格式如下：
-{{
-    "question": "题目内容",
-    "options": {{
-        "A": "选项A内容",
-        "B": "选项B内容",
-        "C": "选项C内容",
-        "D": "选项D内容"
-    }},
-    "answer": "A",
-    "explanation": "详细解析内容"
-}}
+{output_instruction}
+
+若生成多道题，返回格式示例：{{"questions": [{{"question":"...","options":{{}},"answer":"...","explanation":"..."}}, ...]}}
+若只生成一道题，可返回单题对象：{{"question":"...","options":{{}},"answer":"...","explanation":"..."}}
 """
     
+    content = ""
     try:
-        # 初始化 DeepSeek 客户端
         llm = ChatDeepSeek(
             model="deepseek-chat",
             api_key=settings.DEEPSEEK_API_KEY,
             temperature=0.7
         )
-        
-        # 调用 API 生成题目
         response = llm.invoke(prompt)
-        content = response.content
+        content = response.content or ""
         
-        # 尝试从响应中提取 JSON
-        # 如果响应包含代码块，提取其中的 JSON
         if "```json" in content:
             json_start = content.find("```json") + 7
             json_end = content.find("```", json_start)
@@ -192,86 +238,94 @@ def generate_question(state: WorkflowState) -> WorkflowState:
             json_end = content.find("```", json_start)
             json_str = content[json_start:json_end].strip()
         else:
-            # 尝试直接解析整个响应
             json_str = content.strip()
         
-        # 解析 JSON
-        question_data = json.loads(json_str)
+        data = json.loads(json_str)
+        questions_list = data.get("questions")
+        if questions_list is None and isinstance(data, dict) and "question" in data:
+            questions_list = [data]
+        if not isinstance(questions_list, list):
+            questions_list = [data] if isinstance(data, dict) else []
+        
+        # 归一化：每题都有 question, options, answer, explanation
+        normalized = []
+        for q in questions_list[:question_count]:
+            if not isinstance(q, dict):
+                continue
+            normalized.append({
+                "question": q.get("question", ""),
+                "options": q.get("options") if isinstance(q.get("options"), dict) else {},
+                "answer": str(q.get("answer", "")),
+                "explanation": q.get("explanation", ""),
+            })
         
         return {
             **state,
-            "generated_question": question_data
+            "generated_question": normalized[0] if normalized else None,
+            "generated_questions": normalized,
         }
     except json.JSONDecodeError as e:
         print(f"❌ JSON 解析失败: {str(e)}")
         print(f"响应内容: {content[:500]}")
-        return {
-            **state,
-            "generated_question": None
-        }
+        return {**state, "generated_question": None, "generated_questions": []}
     except Exception as e:
         print(f"❌ 生成题目失败: {str(e)}")
-        return {
-            **state,
-            "generated_question": None
-        }
+        return {**state, "generated_question": None, "generated_questions": []}
 
 
 def human_review_checkpoint(state: WorkflowState) -> WorkflowState:
     """
-    节点3：人工审核中断点（Checkpoint）
-    将生成的题目状态设为 pending 并存入 AuditTask，暂停等待人工审核
-    同时将题目数据保存到 Redis 中，以便审核通过后使用
+    节点3：人工审核中断点
+    将生成的题目（单题或多题）分别创建 AuditTask 并存入 Redis
     """
-    generated_question = state.get("generated_question")
+    generated_questions = state.get("generated_questions")
+    if not generated_questions:
+        generated_question = state.get("generated_question")
+        if generated_question:
+            generated_questions = [generated_question]
     source_document = state.get("source_document")
     
-    if not generated_question:
-        return {
-            **state,
-            "audit_task_id": None
-        }
+    if not generated_questions:
+        return {**state, "audit_task_id": None, "audit_task_ids": []}
     
-    # 创建审核任务
     db = SessionLocal()
+    audit_task_ids = []
     try:
-        audit_task = AuditTask(
-            status=AuditStatus.PENDING,
-            comment=None,
-            processed_at=None
-        )
-        db.add(audit_task)
-        db.commit()
-        db.refresh(audit_task)
-        
-        audit_task_id = audit_task.id
-        
-        # 将题目数据保存到 Redis（临时存储，审核通过后使用）
-        question_data = {
-            "question": generated_question.get("question", ""),
-            "options": generated_question.get("options", {}),
-            "answer": generated_question.get("answer", ""),
-            "explanation": generated_question.get("explanation", ""),
-            "source_document": source_document
-        }
-        redis_key = f"audit_task:{audit_task_id}:question_data"
-        redis_client.setex(
-            redis_key,
-            86400,  # 24小时过期
-            json.dumps(question_data, ensure_ascii=False)
-        )
-        
+        for q in generated_questions:
+            audit_task = AuditTask(
+                status=AuditStatus.PENDING,
+                comment=None,
+                processed_at=None
+            )
+            db.add(audit_task)
+            db.commit()
+            db.refresh(audit_task)
+            tid = audit_task.id
+            audit_task_ids.append(tid)
+            question_type = state.get("question_type") or "single_choice"
+            question_data = {
+                "question": q.get("question", ""),
+                "options": q.get("options") if isinstance(q.get("options"), dict) else {},
+                "answer": str(q.get("answer", "")),
+                "explanation": q.get("explanation", ""),
+                "source_document": source_document,
+                "question_type": question_type,
+            }
+            redis_key = f"audit_task:{tid}:question_data"
+            redis_client.setex(
+                redis_key,
+                86400,
+                json.dumps(question_data, ensure_ascii=False)
+            )
         return {
             **state,
-            "audit_task_id": audit_task_id
+            "audit_task_id": audit_task_ids[0] if audit_task_ids else None,
+            "audit_task_ids": audit_task_ids,
         }
     except Exception as e:
         print(f"❌ 创建审核任务失败: {str(e)}")
         db.rollback()
-        return {
-            **state,
-            "audit_task_id": None
-        }
+        return {**state, "audit_task_id": None, "audit_task_ids": []}
     finally:
         db.close()
 
@@ -310,13 +364,14 @@ def save_question_from_audit(audit_task_id: int, audit_comment: Optional[str] = 
         
         question_data = json.loads(question_data_str)
         
-        # 创建试题记录
+        # 创建试题记录（含试题类型）
         exam_question = ExamQuestion(
             question=question_data.get("question", ""),
             options=json.dumps(question_data.get("options", {}), ensure_ascii=False),
             answer=question_data.get("answer", ""),
             explanation=question_data.get("explanation", ""),
             source_document=question_data.get("source_document"),
+            question_type=question_data.get("question_type") or "single_choice",
             created_at=datetime.utcnow()
         )
         db.add(exam_question)
