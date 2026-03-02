@@ -21,6 +21,10 @@ const nextConfig = {
         source: '/questions/:path*',
         destination: `http://${apiHost}/questions/:path*`,
       },
+      {
+        source: '/documents/:path*',
+        destination: `http://${apiHost}/documents/:path*`,
+      },
     ];
   },
 };

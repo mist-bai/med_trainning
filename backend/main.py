@@ -15,7 +15,13 @@ from fastapi.responses import StreamingResponse
 
 # 导入数据库和工作流模块
 from database import init_database, get_db, ExamQuestion, AuditTask, AuditStatus
-from workflow import workflow_app, WorkflowState, save_question_from_audit, delete_audit_question_data
+from workflow import (
+    workflow_app,
+    WorkflowState,
+    save_question_from_audit,
+    delete_audit_question_data,
+    list_vectorized_documents,
+)
 
 # 1. 定义配置类，Pydantic 会自动从环境变量或 .env 中读取同名变量
 class Settings(BaseSettings):
@@ -628,6 +634,24 @@ async def audit_action(
             question_id=None,
             new_audit_task_id=None,
         )
+
+
+# ==================== 已向量化文档列表（知识库） ====================
+
+class VectorizedDocumentItem(BaseModel):
+    document: str
+    summary: str
+    chunk_count: int
+
+
+@app.get("/documents/vectorized", response_model=List[VectorizedDocumentItem])
+async def get_vectorized_documents():
+    """
+    获取当前已向量化并写入知识库（Qdrant med_knowledge_base）的文档列表，
+    含每个文档的主题摘要（首段文本截取）与分块数量。
+    """
+    items = list_vectorized_documents()
+    return [VectorizedDocumentItem(**x) for x in items]
 
 
 # ==================== 审核通过试题列表与导出 ====================

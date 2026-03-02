@@ -39,6 +39,10 @@ export default function AuditPage() {
   const [selectedTaskIds, setSelectedTaskIds] = useState<Set<number>>(new Set());
   /** 是否正在批量审批 */
   const [batchApproving, setBatchApproving] = useState(false);
+  /** 已向量化文档列表（知识库） */
+  const [docList, setDocList] = useState<{ document: string; summary: string; chunk_count: number }[]>([]);
+  const [docListLoading, setDocListLoading] = useState(false);
+  const [docListOpen, setDocListOpen] = useState(false);
 
   // 获取待审核列表
   const fetchAuditList = async () => {
@@ -204,12 +208,30 @@ export default function AuditPage() {
     }
   };
 
+  const fetchDocList = async () => {
+    setDocListLoading(true);
+    try {
+      const res = await fetch('/documents/vectorized');
+      if (res.ok) {
+        const data = await res.json();
+        setDocList(data);
+      }
+    } catch {
+      setDocList([]);
+    } finally {
+      setDocListLoading(false);
+    }
+  };
+
   useEffect(() => {
     fetchAuditList();
-    // 每5秒自动刷新一次
     const interval = setInterval(fetchAuditList, 5000);
     return () => clearInterval(interval);
   }, []);
+
+  useEffect(() => {
+    if (docListOpen) fetchDocList();
+  }, [docListOpen]);
 
   return (
     <div className="min-h-screen bg-slate-50 py-8">
@@ -284,6 +306,50 @@ export default function AuditPage() {
                 )}
               </button>
             </div>
+          </div>
+
+          {/* 已向量化文档列表（可展开） */}
+          <div className="mb-6 rounded-xl border border-slate-200/80 bg-white shadow-sm overflow-hidden">
+            <button
+              type="button"
+              onClick={() => setDocListOpen((v) => !v)}
+              className="w-full flex items-center justify-between px-5 py-3 text-left text-sm font-medium text-slate-700 hover:bg-slate-50 transition-colors"
+            >
+              <span className="text-violet-600">已向量化文档（知识库）</span>
+              <span className="text-slate-400">{docListOpen ? '收起' : '展开查看'}</span>
+            </button>
+            {docListOpen && (
+              <div className="border-t border-slate-200/80 px-5 py-4 bg-slate-50/50">
+                {docListLoading ? (
+                  <div className="flex items-center gap-2 text-slate-500 text-sm">
+                    <span className="inline-block w-4 h-4 border-2 border-slate-300 border-t-violet-500 rounded-full animate-spin" />
+                    加载中…
+                  </div>
+                ) : docList.length === 0 ? (
+                  <p className="text-slate-500 text-sm">暂无已向量化文档，或知识库未就绪。</p>
+                ) : (
+                  <ul className="space-y-3">
+                    {docList.map((doc, i) => (
+                      <li
+                        key={i}
+                        className="p-3 rounded-lg bg-white border border-slate-200/80 shadow-sm"
+                      >
+                        <div className="flex items-center gap-2 mb-1">
+                          <span className="text-xs font-medium text-violet-600 bg-violet-50 px-2 py-0.5 rounded">
+                            {doc.document}
+                          </span>
+                          <span className="text-xs text-slate-400">共 {doc.chunk_count} 个分块</span>
+                        </div>
+                        <p className="text-sm text-slate-600 line-clamp-2">{doc.summary}</p>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                <p className="mt-3 text-xs text-slate-400">
+                  后续将增加上传页面，配合 med_upload 工具扫描文件路径自动上传并向量化。
+                </p>
+              </div>
+            )}
           </div>
         </div>
 

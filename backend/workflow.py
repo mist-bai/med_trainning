@@ -461,5 +461,53 @@ def delete_audit_question_data(audit_task_id: int):
         return False
 
 
+def list_vectorized_documents(collection_name: str = "med_knowledge_base") -> List[Dict[str, Any]]:
+    """
+    从 Qdrant 集合中列出已向量化的文档列表，并返回每个文档的主题摘要（首段文本截取）。
+    供审核管理界面「已向量化文档」展示使用。
+    """
+    result = []
+    try:
+        offset = None
+        doc_chunks: Dict[str, List[Dict[str, Any]]] = {}
+        limit = 100
+        while True:
+            points, next_offset = qdrant_client.scroll(
+                collection_name=collection_name,
+                limit=limit,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for pt in points or []:
+                payload = pt.payload or {}
+                doc_name = (payload.get("document") or payload.get("source") or "未知文档").strip()
+                if not doc_name:
+                    doc_name = "未知文档"
+                text = (payload.get("text") or "").strip()
+                if doc_name not in doc_chunks:
+                    doc_chunks[doc_name] = []
+                doc_chunks[doc_name].append({"text": text})
+            if next_offset is None:
+                break
+            offset = next_offset
+        for doc_name, chunks in sorted(doc_chunks.items()):
+            summary = ""
+            if chunks and chunks[0].get("text"):
+                raw = chunks[0]["text"].replace("\n", " ").strip()
+                summary = (raw[:200] + "…") if len(raw) > 200 else raw
+            result.append({
+                "document": doc_name,
+                "summary": summary or "（暂无摘要）",
+                "chunk_count": len(chunks),
+            })
+    except Exception as e:
+        print(f"❌ 获取已向量化文档列表失败: {str(e)}")
+    return result
+
+
 # 导出保存函数供 API 使用
-__all__ = ['workflow_app', 'save_question_from_audit', 'delete_audit_question_data', 'WorkflowState']
+__all__ = [
+    'workflow_app', 'save_question_from_audit', 'delete_audit_question_data',
+    'WorkflowState', 'list_vectorized_documents',
+]
